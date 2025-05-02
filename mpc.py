@@ -3,13 +3,15 @@ import numpy as np
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-from pyDOE import lhs
+from mlp import MLP
+import torch
+
 
 # 系统参数
 M = 1.0
-m = 0.2
+m = 0.1
 l = 0.5
-g = 9.81
+g = 9.8
 I = (1/3) * m * l**2
 
 def pendulum_dynamics(x, u):
@@ -18,16 +20,16 @@ def pendulum_dynamics(x, u):
 
     sin_theta = ca.sin(x3)
     cos_theta = ca.cos(x3)
-    total_mass = M + m
+    total_mass = M + m * sin_theta ** 2
 
     x1_dot = x2
-    x2_dot = (F + m * l * x4**2 * sin_theta - m * g * sin_theta * cos_theta) / total_mass
+    x2_dot = (F - m * l * x4**2 * sin_theta - m * g * sin_theta * cos_theta) / total_mass
     theta1_dot = x4
-    theta2_dot = (m * l * x4**2 * sin_theta * cos_theta - m * g * sin_theta - F * cos_theta) / (l * (4/3 - m * cos_theta**2 / total_mass))
+    theta2_dot = (m * l * x4**2 * sin_theta * cos_theta + (M+m) * g * sin_theta - F * cos_theta) / (l * total_mass)
 
     return ca.vertcat(x1_dot, x2_dot, theta1_dot, theta2_dot)
 
-def mpc_control(N=20, dt=0.2):
+def mpc_control(N=20, dt=0.02):
     F_max = 10
 
     # 定义符号变量
@@ -71,7 +73,7 @@ def mpc_control(N=20, dt=0.2):
     solver = ca.nlpsol('solver', 'ipopt', nlp, opts)
     return solver, lbx, ubx
 
-def simulate_single(initial_state, solver, lbx, ubx, T=100, dt=0.2):
+def simulate_single(initial_state, solver, lbx, ubx, T=100, dt=0.02):
     """
     给定初始状态，使用MPC仿真一条轨迹。
     返回 states 和 inputs。
@@ -102,54 +104,91 @@ def simulate_single(initial_state, solver, lbx, ubx, T=100, dt=0.2):
 
     return np.array(states), np.array(inputs)
 
-def sample_initial_state_lhs(n_samples=300):
-    ranges = {
-        'x': (-0.5, 0.5),
-        'x_dot': (-1.0, 1.0),
-        'theta': (np.pi - 0.3, np.pi + 0.3),
-        'theta_dot': (-2.0, 2.0)
-    }
+def predict_inputs(model, states):
+    model.eval()
+    X = states[:-1]
+    X_tensor = torch.tensor(X, dtype=torch.float32).to(next(model.parameters()).device)
+    with torch.no_grad():
+        predictions = model(X_tensor)
+    predictions = predictions.cpu().numpy().flatten()
+    return np.clip(predictions, -10, 10)
 
-    samples = lhs(4, samples=n_samples)
-    initial_states = []
-    for i in range(n_samples):
-        x = ranges['x'][0] + (ranges['x'][1] - ranges['x'][0]) * samples[i, 0]
-        x_dot = ranges['x_dot'][0] + (ranges['x_dot'][1] - ranges['x_dot'][0]) * samples[i, 1]
-        theta = ranges['theta'][0] + (ranges['theta'][1] - ranges['theta'][0]) * samples[i, 2]
-        theta_dot = ranges['theta_dot'][0] + (ranges['theta_dot'][1] - ranges['theta_dot'][0]) * samples[i, 3]
-        initial_states.append(np.array([x, x_dot, theta, theta_dot]))
+def compare_inputs(mpc_inputs, model_inputs, dt):
+    """
+    绘图对比 MPC 控制输入与模型预测输入。
+    """
+    times = np.arange(0, len(mpc_inputs) * dt, dt)
+    
+    plt.figure()
+    plt.plot(times, mpc_inputs, label='MPC Input', linewidth=2)
+    plt.plot(times, model_inputs, label='Model Prediction', linestyle='--')
+    plt.title("MPC vs Model Predicted Input")
+    plt.xlabel("Time (s)")
+    plt.ylabel("Control Input (Force)")
+    plt.legend()
+    plt.grid(True)
+    plt.savefig("input_comparison.png")
 
-    print("work")
-    return np.array(initial_states)
+    # 差值
+    input_diff = np.abs(np.array(mpc_inputs) - np.array(model_inputs))
+    plt.figure()
+    plt.plot(times, input_diff, label='Absolute Input Error', color='red')
+    plt.title("Prediction Error")
+    plt.xlabel("Time (s)")
+    plt.ylabel("Error (|F_MPC - F_model|)")
+    plt.grid(True)
+    plt.savefig("input_error.png")
 
-def collect_dataset(num_trajectories=300):
-    solver, lbx, ubx = mpc_control()
-    initial_states = sample_initial_state_lhs(num_trajectories)
-    all_states = []
-    all_actions = []
+def simulate_single_mlp(model, initial_state, solver, lbx, ubx, T=100, dt=0.02):
+    """
+    给定初始状态，使用MPC仿真一条轨迹。
+    返回 states 和 inputs。
+    """
+    times = np.arange(0, T, dt)
+    states = [initial_state]
+    inputs = []
+    init = predict_inputs(model, initial_state)
+    u_init = np.linspace(init[0], 0, 20)  # 初始控制猜测
+    x0 = np.array(states[-1])
 
-    i = 0
-    for x_init in initial_states:
-        i += 1
-        print(i)
-        states, actions = simulate_single(x_init, solver, lbx, ubx, T=2, dt=0.2)
-        all_states.append(states[:-1])  # 去掉最后一个状态
-        all_actions.append(actions)
+    for t in times:
+        
+        solver_args = {'x0': u_init, 'p': x0, 'lbx': lbx, 'ubx': ubx}
+        sol = solver(**solver_args)
 
-    all_states = np.vstack(all_states)
-    all_actions = np.hstack(all_actions).reshape(-1, 1)
+        u_opt = np.array(sol['x']).flatten()
+        F_opt = u_opt[0]
 
-    print(f"采集到 {all_states.shape[0]} 个样本")
-    np.save('states.npy', all_states)
-    np.save('actions.npy', all_actions)
-    print("数据集保存完成！")
+        # 记录控制输入
+        inputs.append(F_opt)
+
+        # 更新状态
+        dx = np.array(pendulum_dynamics(x0, np.array([F_opt]))).flatten()
+        x_new = x0 + dx * dt
+        states.append(x_new)
+        x0 = np.array(states[-1])
+
+        # 解决MPC问题
+        init = predict_inputs(model, x0)
+        u_init = np.linspace(init[0], inputs[-1], 20)
+
+    return np.array(states), np.array(inputs)
+
 
 if __name__ == '__main__':
-    solver, lbx, ubx = mpc_control()
-    x_init = np.array([0, 0, np.pi - 0.1, 0])
-    states, actions = simulate_single(x_init, solver, lbx, ubx)
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    device = torch.device(device)
+    model = MLP(4, 64, 3).to(device)
+    model.load_state_dict(torch.load('best_mlp_controller_kfold.pth', map_location=device))
+    model.eval()
 
-    times = np.arange(0, len(actions)*0.02, 0.02)
+    DT = 0.02
+    solver, lbx, ubx = mpc_control(N=20, dt = DT)
+    x_init = np.array([0.5, 0, -0.5, 0])
+    states, actions = simulate_single(x_init, solver, lbx, ubx, dt = DT)
+    states2, actions2 = simulate_single_mlp(model, x_init, solver, lbx, ubx, dt = DT)
+
+    times = np.arange(0, len(actions)*DT, DT)
     plt.figure()
     plt.subplot(2, 1, 1)
     plt.plot(times, states[:-1, 2], label='theta')
@@ -158,5 +197,14 @@ if __name__ == '__main__':
     plt.plot(times, actions, label='Force')
     plt.title("Control Input (Force)")
     plt.savefig('mpc_result.png')
+    times = np.arange(0, len(actions)*DT, DT)
+    plt.figure()
+    plt.subplot(2, 1, 1)
+    plt.plot(times, states2[:-1, 2], label='theta')
+    plt.title("Pendulum Angle")
+    plt.subplot(2, 1, 2)
+    plt.plot(times, actions2, label='Force')
+    plt.title("Control Input (Force)")
+    plt.savefig('mpcmlp_result.png')
 
-    collect_dataset()
+    #compare_inputs(actions, predict_inputs(model, states), DT)

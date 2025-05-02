@@ -54,7 +54,7 @@ if __name__ == '__main__':
     plt.savefig('mpc_result.png')
 
     # 使用MLP控制器进行仿真
-    x_init = np.array([0, 0, np.pi - 0.1, 0])
+    x_init = np.array([1, 0, np.pi - 0.1, 0])
     states_mlp, actions_mlp = simulate_single_mlp(x_init)
 
     # 画图
